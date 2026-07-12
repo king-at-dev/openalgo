@@ -42,15 +42,6 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.token_modes = {}
         self.token_correlation_ids = {}
 
-        # Subscribe coalescing — mirrors angel/zerodha subscription_queue + batch_timer.
-        # Per-symbol subscribe() calls append to the queue and arm a 500ms timer;
-        # the timer drains the queue and emits broker-side subscribe messages. The
-        # delay also bridges the cold-start race between connect() returning and
-        # _on_connect firing.
-        self.subscription_queue: list[dict[str, Any]] = []
-        self.batch_timer: threading.Timer | None = None
-        self.batch_delay = 0.5  # seconds — matches angel/zerodha fleet pattern
-
     def initialize(
         self, broker_name: str, user_id: str, auth_data: dict[str, str] | None = None
     ) -> None:
@@ -76,7 +67,7 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.ws_client = MstockWebSocket(
             auth_token=auth_token, token_provider=self._get_fresh_auth_token
         )
-        self.ws_client.on_connect = self._on_connect
+        self.running = True
         self.logger.info(f"mstock adapter initialized for user {user_id}")
 
     def _get_fresh_auth_token(self) -> str | None:
@@ -104,131 +95,10 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.logger.info("Connecting to mstock WebSocket in streaming mode...")
         self.running = True
 
-        # Start streaming — connection happens in background thread (Angel/Upstox pattern).
+        # Start streaming — returns immediately (same as Angel/Upstox pattern)
         self.ws_client.connect_stream(self._on_data)
-
-        # Wait for handshake to complete (Zerodha pattern).
-        self.logger.info("Waiting for WebSocket connection...")
-        if self.ws_client.wait_for_connection(timeout=15.0):
-            self.connected = True
-            self.logger.info("mstock WebSocket adapter connected")
-        elif self.ws_client.running:
-            self.logger.warning("Client started but connection timeout")
-        else:
-            self.logger.error("Failed to establish mstock WebSocket connection")
-
-    def _on_connect(self) -> None:
-        """Callback when the broker session is ready — replay adapter subscriptions."""
-        self.logger.info("mstock WebSocket session ready")
         self.connected = True
-
-        with self.lock:
-            if self.batch_timer is not None:
-                self.batch_timer.cancel()
-                self.batch_timer = None
-            self.subscription_queue.clear()
-            tokens_to_replay = dict(self.token_modes)
-            ws_subs = (
-                list(self.ws_client.subscriptions.values())
-                if self.ws_client
-                else []
-            )
-
-        for token, mode in tokens_to_replay.items():
-            exchange_type = None
-            symbol = token
-            with self.lock:
-                for sub in self.subscriptions.values():
-                    if sub["token"] == token:
-                        exchange_type = sub["exchange_type"]
-                        symbol = sub["symbol"]
-                        break
-
-            if exchange_type is None:
-                continue
-
-            current_mstock_mode = max(
-                (
-                    ws_sub.get("mode", 0)
-                    for ws_sub in ws_subs
-                    if ws_sub.get("token") == token
-                ),
-                default=0,
-            )
-            self._send_ws_subscription(
-                symbol, token, exchange_type, mode, current_mstock_mode
-            )
-
-    def _start_batch_timer(self) -> None:
-        """Arm the coalescing timer that drains subscription_queue."""
-        with self.lock:
-            if self.batch_timer is not None:
-                self.batch_timer.cancel()
-            self.batch_timer = threading.Timer(
-                self.batch_delay, self._process_batch_subscriptions
-            )
-            self.batch_timer.daemon = True
-            self.batch_timer.start()
-
-    def _process_batch_subscriptions(self) -> None:
-        """Drain the queue and send broker subscribe messages."""
-        with self.lock:
-            if not self.subscription_queue:
-                self.batch_timer = None
-                return
-            pending = list(self.subscription_queue)
-            self.subscription_queue.clear()
-            self.batch_timer = None
-
-        if not self.connected or not self.ws_client:
-            self.logger.warning(
-                f"Dropping batch of {len(pending)} subscriptions — not connected; "
-                f"_on_connect will replay from self.subscriptions"
-            )
-            return
-
-        # Collapse to one subscribe per token using the highest queued mode.
-        by_token: dict[str, dict[str, Any]] = {}
-        for sub in pending:
-            token = sub["token"]
-            existing = by_token.get(token)
-            if existing is None or sub["subscribe_mode"] > existing["subscribe_mode"]:
-                by_token[token] = sub
-
-        for sub in by_token.values():
-            self._send_ws_subscription(
-                sub["symbol"],
-                sub["token"],
-                sub["exchange_type"],
-                sub["subscribe_mode"],
-                sub["current_mstock_mode"],
-            )
-
-    def _send_ws_subscription(
-        self, symbol: str, token: str, exchange_type: int, subscribe_mode: int, current_mstock_mode: int
-    ) -> None:
-        """Subscribe or upgrade a token on the broker WebSocket."""
-        try:
-            if current_mstock_mode > 0 and token in self.token_correlation_ids:
-                old_correlation_id = self.token_correlation_ids[token]
-                if old_correlation_id in self.ws_client.subscriptions:
-                    self.ws_client.unsubscribe_stream(old_correlation_id)
-                    time.sleep(0.2)
-
-            mstock_correlation_id = f"mstock_{token}_{subscribe_mode}"
-            result = self.ws_client.subscribe_stream(
-                mstock_correlation_id, token, exchange_type, subscribe_mode
-            )
-
-            if result:
-                self.token_correlation_ids[token] = mstock_correlation_id
-                self.logger.info(
-                    f"Subscribed to {symbol} (token: {token}) with mode {subscribe_mode}"
-                )
-            else:
-                self.logger.warning(f"Failed to subscribe to {symbol}")
-        except Exception as e:
-            self.logger.error(f"Error subscribing: {str(e)}")
+        self.logger.info("mstock WebSocket adapter connected")
 
     def _on_data(self, quote_data: dict) -> None:
         """Callback function called when data is received from WebSocket"""
@@ -274,12 +144,7 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
     def disconnect(self) -> None:
         """Disconnect from mstock WebSocket"""
-        with self.lock:
-            self.running = False
-            if self.batch_timer is not None:
-                self.batch_timer.cancel()
-                self.batch_timer = None
-            self.subscription_queue.clear()
+        self.running = False
 
         if self.ws_client:
             self.ws_client.disconnect_stream()
@@ -299,16 +164,6 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
         if mode == 3 and depth_level not in [5]:
             return self._create_error_response(
                 "INVALID_DEPTH", f"Invalid depth level {depth_level}. mstock only supports 5 levels"
-            )
-
-        if not self.running:
-            return self._create_error_response(
-                "NOT_CONNECTED", "WebSocket not connected. Call connect() first."
-            )
-
-        if not self.ws_client:
-            return self._create_error_response(
-                "NOT_INITIALIZED", "WebSocket client not initialized"
             )
 
         token_info = SymbolMapper.get_token_from_symbol(symbol, exchange)
@@ -349,29 +204,34 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
         if needs_ws_subscribe and self.ws_client and self.running:
             if not self.ws_client.is_connected():
-                self.logger.warning("WebSocket not connected, waiting for connection...")
-                if not self.ws_client.wait_for_connection(timeout=10.0):
-                    self.logger.warning(
-                        f"Subscription for {symbol} stored locally; will be sent from _on_connect"
-                    )
-                else:
-                    self.connected = True
-
-            if self.connected and self.ws_client:
+                self.logger.warning(
+                    f"WebSocket not connected, subscription for {symbol} stored locally but not sent to broker"
+                )
+            else:
                 try:
-                    with self.lock:
-                        self.subscription_queue.append({
-                            "symbol": symbol,
-                            "token": token,
-                            "exchange_type": exchange_type,
-                            "subscribe_mode": subscribe_mode,
-                            "current_mstock_mode": current_mstock_mode,
-                        })
-                        if len(self.subscription_queue) == 1:
-                            self._start_batch_timer()
+                    # Unsubscribe old mode if upgrading
+                    if current_mstock_mode > 0 and token in self.token_correlation_ids:
+                        old_correlation_id = self.token_correlation_ids[token]
+                        if old_correlation_id in self.ws_client.subscriptions:
+                            self.ws_client.unsubscribe_stream(old_correlation_id)
+                            time.sleep(0.2)
+
+                    # Subscribe with new mode
+                    mstock_correlation_id = f"mstock_{token}_{subscribe_mode}"
+                    result = self.ws_client.subscribe_stream(
+                        mstock_correlation_id, token, exchange_type, subscribe_mode
+                    )
+
+                    if result:
+                        self.token_correlation_ids[token] = mstock_correlation_id
+                        self.logger.info(
+                            f"Subscribed to {symbol} (token: {token}) on {exchange} with mode {subscribe_mode}"
+                        )
+                    else:
+                        self.logger.warning(f"Failed to subscribe to {symbol} on {exchange}")
+
                 except Exception as e:
-                    self.logger.error(f"Error queuing subscription for {symbol}.{exchange}: {e}")
-                    return self._create_error_response("SUBSCRIPTION_ERROR", str(e))
+                    self.logger.error(f"Error subscribing: {str(e)}")
 
         return {
             "status": "success",

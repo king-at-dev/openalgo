@@ -45,9 +45,7 @@ class MstockWebSocket:
         self.subscriptions: dict[str, dict] = {}
         self._ws_thread: threading.Thread | None = None
         self._logged_in = False
-        self._connection_ready = threading.Event()
-        # Adapter callback when the session is ready for subscriptions (cold start + reconnect).
-        self.on_connect = None
+        self._login_event = threading.Event()
 
     def _build_ws_url(self) -> str:
         """Build the WebSocket URL with the current API key and access token."""
@@ -209,7 +207,7 @@ class MstockWebSocket:
         self.data_callback = data_callback
         self.running = True
         self._logged_in = False
-        self._connection_ready.clear()
+        self._login_event.clear()
 
         self.ws = websocket.WebSocketApp(
             self.ws_url,
@@ -240,7 +238,6 @@ class MstockWebSocket:
 
             self._connected = False
             self._logged_in = False
-            self._connection_ready.clear()
 
             if not self.running:
                 break
@@ -274,38 +271,14 @@ class MstockWebSocket:
         self._connected = True
         self._reconnect_attempts = 0
 
-        # Send LOGIN message — required by mstock to keep the session alive.
+        # Send LOGIN message
         login_msg = f"LOGIN:{self.auth_token}"
         ws.send(login_msg)
         logger.debug("Sent LOGIN message")
 
-        # mstock docs do not define a text login ACK; the session is ready once
-        # LOGIN is sent (URL already carries API_KEY + ACCESS_TOKEN).
-        self._confirm_login()
-
-    def _confirm_login(self) -> None:
-        """Mark the session logged-in and replay any pending subscriptions."""
-        if self._logged_in:
-            return
-
-        self._logged_in = True
-        self._connection_ready.set()
-        logger.info("mstock login confirmed")
-
-        self._resubscribe_all()
-
-        if self.on_connect:
-            try:
-                self.on_connect()
-            except Exception as callback_err:
-                logger.error(f"mstock on_connect callback error: {callback_err}")
-
     def _on_ws_message(self, ws, message):
         """Called for both binary and text messages"""
         if isinstance(message, bytes):
-            if not self._logged_in:
-                self._confirm_login()
-
             # Parse binary packet
             if len(message) in [51, 123, 379] or len(message) >= 383:
                 quote_data = self.parse_binary_packet(message)
@@ -313,9 +286,14 @@ class MstockWebSocket:
                     self.data_callback(quote_data)
         elif isinstance(message, str):
             logger.debug(f"Received string message: {message}")
-            lowered = message.lower()
-            if "error" in lowered or "fail" in lowered or "invalid" in lowered:
-                logger.warning(f"mstock WebSocket message: {message}")
+            # Mark as logged in after receiving login response
+            if not self._logged_in:
+                self._logged_in = True
+                self._login_event.set()
+                logger.info("mstock login confirmed")
+
+                # Re-subscribe to existing subscriptions
+                self._resubscribe_all()
 
     def _on_ws_error(self, ws, error):
         """Called on WebSocket error"""
@@ -327,7 +305,6 @@ class MstockWebSocket:
         logger.info(f"WebSocket closed (code={close_status_code}, msg={close_msg})")
         self._connected = False
         self._logged_in = False
-        self._connection_ready.clear()
 
     def _resubscribe_all(self):
         """Re-subscribe to all tracked subscriptions after reconnection"""
@@ -427,10 +404,6 @@ class MstockWebSocket:
     def is_connected(self) -> bool:
         """Check if WebSocket is connected and logged in"""
         return self._connected and self._logged_in and self.running
-
-    def wait_for_connection(self, timeout: float = 15.0) -> bool:
-        """Wait until the WebSocket is connected and login is confirmed."""
-        return self._connection_ready.wait(timeout=timeout) and self.is_connected()
 
     # ==================== One-off Fetch (sync) ====================
 
