@@ -4,6 +4,7 @@ mstock WebSocket adapter implementation (synchronous).
 Uses sync websocket-client to avoid asyncio event loop conflicts
 with eventlet in gunicorn+eventlet deployments.
 """
+
 import copy
 import json
 import logging
@@ -67,6 +68,8 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
         self.ws_client = MstockWebSocket(
             auth_token=auth_token, token_provider=self._get_fresh_auth_token
         )
+        # Official SDK pattern: subscribe only after LOGIN via on_connect.
+        self.ws_client.on_connect = self._on_session_ready
         self.running = True
         self.logger.info(f"mstock adapter initialized for user {user_id}")
 
@@ -86,19 +89,136 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
             self.logger.warning(f"Failed to re-read fresh mstock auth token: {e}")
             return None
 
-    def connect(self) -> None:
-        """Establish persistent connection to mstock WebSocket"""
+    def connect(self) -> dict[str, Any]:
+        """
+        Establish persistent connection to mstock WebSocket.
+
+        Starts the broker socket in a background thread and returns quickly.
+        Session readiness (LOGIN sent) is signaled via ``_on_session_ready``,
+        matching the official MTicker on_connect lifecycle:
+
+            send_login_after_connect()
+            ws.subscribe(...)
+
+        Early subscribe() calls are queued locally and flushed from that callback.
+        """
         if not self.ws_client:
             self.logger.error("WebSocket client not initialized. Call initialize() first.")
+            return {"status": "error", "message": "WebSocket client not initialized"}
+
+        try:
+            self.logger.info("Connecting to mstock WebSocket in streaming mode...")
+            self.running = True
+            self.connected = False
+
+            # Ensure callback is wired (safe if initialize already set it).
+            self.ws_client.on_connect = self._on_session_ready
+            self.ws_client.connect_stream(self._on_data)
+
+            # Do not block here — ConnectionPool.connect() holds its lock while
+            # this runs. LOGIN + subscription flush happen asynchronously in
+            # _on_session_ready (official on_connect pattern).
+            self.logger.info(
+                "mstock WebSocket connection started; subscriptions will flush after LOGIN"
+            )
+            return {
+                "status": "success",
+                "message": "Client started, connection in progress",
+            }
+        except Exception as e:
+            self.logger.error(f"Error connecting mstock WebSocket: {e}")
+            return {"status": "error", "message": str(e)}
+
+    def _highest_mode_by_token(self) -> dict[str, dict[str, Any]]:
+        """Collapse local subscriptions to the highest mode per broker token."""
+        by_token: dict[str, dict[str, Any]] = {}
+        with self.lock:
+            for sub in self.subscriptions.values():
+                token = sub["token"]
+                existing = by_token.get(token)
+                if existing is None or sub["mode"] > existing["mode"]:
+                    by_token[token] = sub
+        return by_token
+
+    def _drop_stale_token_subscription(self, token: str, mode: int) -> None:
+        """Unsubscribe a prior mode for ``token`` when upgrading/replaying."""
+        if not self.ws_client:
             return
+        old_correlation_id = self.token_correlation_ids.get(token)
+        if not old_correlation_id or old_correlation_id not in self.ws_client.subscriptions:
+            return
+        old_mode = self.ws_client.subscriptions[old_correlation_id].get("mode", 0)
+        if old_mode != mode:
+            self.ws_client.unsubscribe_stream(old_correlation_id)
 
-        self.logger.info("Connecting to mstock WebSocket in streaming mode...")
-        self.running = True
+    def _flush_token_subscription(self, token: str, sub: dict[str, Any]) -> None:
+        """Send one queued subscription to the broker after LOGIN."""
+        mode = sub["mode"]
+        exchange_type = sub["exchange_type"]
+        symbol = sub["symbol"]
+        try:
+            self._drop_stale_token_subscription(token, mode)
+            mstock_correlation_id = f"mstock_{token}_{mode}"
+            if self.ws_client and self.ws_client.subscribe_stream(
+                mstock_correlation_id, token, exchange_type, mode
+            ):
+                self.token_correlation_ids[token] = mstock_correlation_id
+                self.token_modes[token] = mode
+                self.logger.info(f"Flushed subscription {symbol} (token: {token}) mode {mode}")
+            else:
+                self.logger.warning(f"Failed to flush subscription for {symbol} (token: {token})")
+        except Exception as e:
+            self.logger.error(f"Error flushing subscription for {symbol}: {e}")
 
-        # Start streaming — returns immediately (same as Angel/Upstox pattern)
-        self.ws_client.connect_stream(self._on_data)
+    def _on_session_ready(self) -> None:
+        """
+        Callback after LOGIN — mirrors official sample on_connect:
+
+            send_login_after_connect()
+            ws.subscribe(...)
+
+        Flush every locally tracked subscription to the broker here so early
+        subscribe() calls that arrived before LOGIN are not lost.
+        """
         self.connected = True
-        self.logger.info("mstock WebSocket adapter connected")
+        self.logger.info("mstock WebSocket session ready — flushing subscriptions")
+        for token, sub in self._highest_mode_by_token().items():
+            self._flush_token_subscription(token, sub)
+
+    def _send_broker_subscribe(
+        self,
+        symbol: str,
+        token: str,
+        exchange_type: int,
+        subscribe_mode: int,
+        current_mstock_mode: int,
+    ) -> bool:
+        """Send (or upgrade) a broker-side subscription when the session is ready."""
+        if not self.ws_client or not self.ws_client.is_connected():
+            return False
+
+        try:
+            if current_mstock_mode > 0 and token in self.token_correlation_ids:
+                old_correlation_id = self.token_correlation_ids[token]
+                if old_correlation_id in self.ws_client.subscriptions:
+                    self.ws_client.unsubscribe_stream(old_correlation_id)
+                    time.sleep(0.2)
+
+            mstock_correlation_id = f"mstock_{token}_{subscribe_mode}"
+            result = self.ws_client.subscribe_stream(
+                mstock_correlation_id, token, exchange_type, subscribe_mode
+            )
+            if result:
+                self.token_correlation_ids[token] = mstock_correlation_id
+                self.logger.info(
+                    f"Subscribed to {symbol} (token: {token}) with mode {subscribe_mode}"
+                )
+            else:
+                self.logger.warning(f"Failed to subscribe to {symbol}")
+            return bool(result)
+        except Exception as e:
+            self.logger.error(f"Error subscribing: {str(e)}")
+            return False
 
     def _on_data(self, quote_data: dict) -> None:
         """Callback function called when data is received from WebSocket"""
@@ -110,7 +230,7 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
 
             matching_subscriptions = []
             with self.lock:
-                for correlation_id, sub in self.subscriptions.items():
+                for _correlation_id, sub in self.subscriptions.items():
                     if sub["token"] == token:
                         matching_subscriptions.append(sub)
 
@@ -129,12 +249,14 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 topic = f"{exchange}_{symbol}_{mode_str}"
 
                 market_data = copy.deepcopy(market_data_base)
-                market_data.update({
-                    "symbol": symbol,
-                    "exchange": exchange,
-                    "mode": mode,
-                    "timestamp": int(time.time() * 1000),
-                })
+                market_data.update(
+                    {
+                        "symbol": symbol,
+                        "exchange": exchange,
+                        "mode": mode,
+                        "timestamp": int(time.time() * 1000),
+                    }
+                )
 
                 self.publish_market_data(topic, market_data)
                 self.logger.debug(f"Published data for {symbol} on {exchange} mode {mode}")
@@ -203,35 +325,15 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
                 self.token_modes[token] = max_mode_for_token
 
         if needs_ws_subscribe and self.ws_client and self.running:
+            # Official SDK only subscribes after LOGIN (inside on_connect).
+            # If the session is not ready yet, keep the local subscription and
+            # let _on_session_ready flush it — do not treat this as failure.
             if not self.ws_client.is_connected():
-                self.logger.warning(
-                    f"WebSocket not connected, subscription for {symbol} stored locally but not sent to broker"
-                )
+                self.logger.info(f"Session not ready — queued {symbol} for subscribe after LOGIN")
             else:
-                try:
-                    # Unsubscribe old mode if upgrading
-                    if current_mstock_mode > 0 and token in self.token_correlation_ids:
-                        old_correlation_id = self.token_correlation_ids[token]
-                        if old_correlation_id in self.ws_client.subscriptions:
-                            self.ws_client.unsubscribe_stream(old_correlation_id)
-                            time.sleep(0.2)
-
-                    # Subscribe with new mode
-                    mstock_correlation_id = f"mstock_{token}_{subscribe_mode}"
-                    result = self.ws_client.subscribe_stream(
-                        mstock_correlation_id, token, exchange_type, subscribe_mode
-                    )
-
-                    if result:
-                        self.token_correlation_ids[token] = mstock_correlation_id
-                        self.logger.info(
-                            f"Subscribed to {symbol} (token: {token}) on {exchange} with mode {subscribe_mode}"
-                        )
-                    else:
-                        self.logger.warning(f"Failed to subscribe to {symbol} on {exchange}")
-
-                except Exception as e:
-                    self.logger.error(f"Error subscribing: {str(e)}")
+                self._send_broker_subscribe(
+                    symbol, token, exchange_type, subscribe_mode, current_mstock_mode
+                )
 
         return {
             "status": "success",
@@ -239,81 +341,91 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
             "correlation_id": correlation_id,
         }
 
+    @staticmethod
+    def _format_depth_level(level: Any) -> dict[str, Any] | None:
+        """Normalize one bid/ask level from dict or list/tuple form."""
+        if isinstance(level, dict):
+            return {
+                "price": float(level.get("price", 0)),
+                "quantity": int(level.get("quantity", 0)),
+                "orders": int(level.get("orders", 0)),
+            }
+        if isinstance(level, (list, tuple)) and len(level) >= 2:
+            return {
+                "price": float(level[0]),
+                "quantity": int(level[1]),
+                "orders": int(level[2]) if len(level) > 2 else 0,
+            }
+        return None
+
+    @classmethod
+    def _format_depth_side(cls, levels: list[Any]) -> list[dict[str, Any]]:
+        """Format up to 5 depth levels for one book side."""
+        formatted = []
+        for level in levels[:5]:
+            parsed = cls._format_depth_level(level)
+            if parsed is not None:
+                formatted.append(parsed)
+        return formatted
+
+    def _quote_fields(self, quote_data: dict) -> dict[str, Any]:
+        """Map quote-mode fields from an mstock packet."""
+        return {
+            "open": float(quote_data.get("open", 0)),
+            "high": float(quote_data.get("high", 0)),
+            "low": float(quote_data.get("low", 0)),
+            "close": float(quote_data.get("close", 0)),
+            "prev_close": float(quote_data.get("close", 0)),
+            "volume": int(quote_data.get("volume", 0)),
+            "oi": int(quote_data.get("oi", 0)),
+            "last_trade_quantity": int(quote_data.get("last_traded_qty", 0)),
+            "average_price": float(quote_data.get("avg_price", 0)),
+            "total_buy_quantity": int(quote_data.get("total_buy_qty", 0)),
+            "total_sell_quantity": int(quote_data.get("total_sell_qty", 0)),
+        }
+
+    def _depth_fields(self, quote_data: dict) -> dict[str, Any]:
+        """Map depth-mode fields from an mstock packet."""
+        return {
+            "depth": {
+                "buy": self._format_depth_side(quote_data.get("bids", [])),
+                "sell": self._format_depth_side(quote_data.get("asks", [])),
+            },
+            "total_buy_quantity": int(quote_data.get("total_buy_qty", 0)),
+            "total_sell_quantity": int(quote_data.get("total_sell_qty", 0)),
+            "upper_circuit": float(quote_data.get("upper_circuit", 0)),
+            "lower_circuit": float(quote_data.get("lower_circuit", 0)),
+        }
+
     def _normalize_market_data(self, quote_data: dict, mode: int) -> dict[str, Any]:
         try:
             normalized = {"ltp": float(quote_data.get("ltp", 0))}
-
             if mode >= 2:
-                normalized.update({
-                    "open": float(quote_data.get("open", 0)),
-                    "high": float(quote_data.get("high", 0)),
-                    "low": float(quote_data.get("low", 0)),
-                    "close": float(quote_data.get("close", 0)),
-                    "prev_close": float(quote_data.get("close", 0)),
-                    "volume": int(quote_data.get("volume", 0)),
-                    "oi": int(quote_data.get("oi", 0)),
-                    "last_trade_quantity": int(quote_data.get("last_traded_qty", 0)),
-                    "average_price": float(quote_data.get("avg_price", 0)),
-                    "total_buy_quantity": int(quote_data.get("total_buy_qty", 0)),
-                    "total_sell_quantity": int(quote_data.get("total_sell_qty", 0)),
-                })
-
+                normalized.update(self._quote_fields(quote_data))
             if mode == 3:
-                bids = quote_data.get("bids", [])[:5]
-                asks = quote_data.get("asks", [])[:5]
-
-                formatted_bids = []
-                for bid in bids:
-                    if isinstance(bid, dict):
-                        formatted_bids.append({
-                            "price": float(bid.get("price", 0)),
-                            "quantity": int(bid.get("quantity", 0)),
-                            "orders": int(bid.get("orders", 0)),
-                        })
-                    elif isinstance(bid, (list, tuple)) and len(bid) >= 2:
-                        formatted_bids.append({
-                            "price": float(bid[0]),
-                            "quantity": int(bid[1]),
-                            "orders": int(bid[2]) if len(bid) > 2 else 0,
-                        })
-
-                formatted_asks = []
-                for ask in asks:
-                    if isinstance(ask, dict):
-                        formatted_asks.append({
-                            "price": float(ask.get("price", 0)),
-                            "quantity": int(ask.get("quantity", 0)),
-                            "orders": int(ask.get("orders", 0)),
-                        })
-                    elif isinstance(ask, (list, tuple)) and len(ask) >= 2:
-                        formatted_asks.append({
-                            "price": float(ask[0]),
-                            "quantity": int(ask[1]),
-                            "orders": int(ask[2]) if len(ask) > 2 else 0,
-                        })
-
-                normalized["depth"] = {"buy": formatted_bids, "sell": formatted_asks}
-                normalized.update({
-                    "total_buy_quantity": int(quote_data.get("total_buy_qty", 0)),
-                    "total_sell_quantity": int(quote_data.get("total_sell_qty", 0)),
-                    "upper_circuit": float(quote_data.get("upper_circuit", 0)),
-                    "lower_circuit": float(quote_data.get("lower_circuit", 0)),
-                })
-
+                normalized.update(self._depth_fields(quote_data))
             return normalized
-
         except Exception as e:
             self.logger.error(f"Error normalizing market data: {str(e)}")
             return {"ltp": 0}
 
-    def unsubscribe(self, symbol: str, exchange: str, mode: int = 2) -> dict[str, Any]:
-        correlation_id = f"{symbol}_{exchange}_{mode}"
+    def _max_mode_for_token(self, token: str) -> int:
+        """Highest remaining local subscription mode for a broker token."""
+        max_mode = 0
+        for sub in self.subscriptions.values():
+            if sub["token"] == token:
+                max_mode = max(max_mode, sub["mode"])
+        return max_mode
 
-        needs_ws_update = False
-        new_mode = 0
-        token = None
-        exchange_type = None
+    def _remove_local_subscription(
+        self, correlation_id: str, symbol: str, exchange: str, mode: int
+    ) -> tuple[str, int, bool, int] | dict[str, Any]:
+        """
+        Drop a local subscription and decide whether the broker feed must change.
 
+        Returns either an error response dict, or
+        ``(token, exchange_type, needs_ws_update, new_mode)``.
+        """
         with self.lock:
             if correlation_id not in self.subscriptions:
                 return self._create_error_response(
@@ -323,15 +435,12 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
             subscription = self.subscriptions[correlation_id]
             token = subscription["token"]
             exchange_type = subscription["exchange_type"]
-
             del self.subscriptions[correlation_id]
 
-            max_mode_for_token = 0
-            for sub in self.subscriptions.values():
-                if sub["token"] == token:
-                    max_mode_for_token = max(max_mode_for_token, sub["mode"])
-
+            max_mode_for_token = self._max_mode_for_token(token)
             current_mstock_mode = self.token_modes.get(token, 0)
+            needs_ws_update = False
+            new_mode = 0
             if max_mode_for_token < current_mstock_mode:
                 needs_ws_update = True
                 new_mode = max_mode_for_token
@@ -341,26 +450,39 @@ class MstockWebSocketAdapter(BaseBrokerWebSocketAdapter):
                     self.token_modes.pop(token, None)
                     self.token_correlation_ids.pop(token, None)
 
+            return token, exchange_type, needs_ws_update, new_mode
+
+    def _apply_broker_unsubscribe(self, token: str, exchange_type: int, new_mode: int) -> None:
+        """Fully remove or downgrade the broker-side subscription for ``token``."""
+        if not self.ws_client:
+            return
+
+        current_correlation_id = self.token_correlation_ids.get(token)
+        if new_mode == 0:
+            if current_correlation_id:
+                self.ws_client.unsubscribe_stream(current_correlation_id)
+                self.logger.info(f"Unsubscribed token {token} from mstock")
+            return
+
+        if current_correlation_id and current_correlation_id in self.ws_client.subscriptions:
+            self.ws_client.unsubscribe_stream(current_correlation_id)
+            time.sleep(0.2)
+
+        new_correlation_id = f"mstock_{token}_{new_mode}"
+        self.ws_client.subscribe_stream(new_correlation_id, token, exchange_type, new_mode)
+        self.token_correlation_ids[token] = new_correlation_id
+        self.logger.debug(f"Downgraded subscription for token {token} to mode {new_mode}")
+
+    def unsubscribe(self, symbol: str, exchange: str, mode: int = 2) -> dict[str, Any]:
+        correlation_id = f"{symbol}_{exchange}_{mode}"
+        result = self._remove_local_subscription(correlation_id, symbol, exchange, mode)
+        if isinstance(result, dict):
+            return result
+
+        token, exchange_type, needs_ws_update, new_mode = result
         if needs_ws_update and self.ws_client and self.running:
             try:
-                current_correlation_id = self.token_correlation_ids.get(token)
-
-                if new_mode == 0:
-                    if current_correlation_id:
-                        self.ws_client.unsubscribe_stream(current_correlation_id)
-                        self.logger.info(f"Unsubscribed token {token} from mstock")
-                else:
-                    if current_correlation_id and current_correlation_id in self.ws_client.subscriptions:
-                        self.ws_client.unsubscribe_stream(current_correlation_id)
-                        time.sleep(0.2)
-
-                    new_correlation_id = f"mstock_{token}_{new_mode}"
-                    self.ws_client.subscribe_stream(
-                        new_correlation_id, token, exchange_type, new_mode
-                    )
-                    self.token_correlation_ids[token] = new_correlation_id
-                    self.logger.debug(f"Downgraded subscription for token {token} to mode {new_mode}")
-
+                self._apply_broker_unsubscribe(token, exchange_type, new_mode)
             except Exception as e:
                 self.logger.error(f"Error updating WebSocket subscription: {str(e)}")
 

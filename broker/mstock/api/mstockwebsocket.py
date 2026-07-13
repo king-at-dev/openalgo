@@ -4,6 +4,7 @@ Synchronous mstock WebSocket client using websocket-client library.
 Uses sync websocket-client instead of async websockets to avoid asyncio
 event loop conflicts with eventlet in gunicorn+eventlet deployments.
 """
+
 import json
 import os
 import ssl
@@ -35,7 +36,7 @@ class MstockWebSocket:
         # (~3 AM IST) does not leave the feed dead with the construction-time token.
         self.token_provider = token_provider
         self.api_key = os.getenv("BROKER_API_SECRET") or os.getenv("BROKER_API_KEY")
-        self.ws_url = self._build_ws_url()
+        self.stream_url = self._build_stream_url()
 
         # Streaming mode variables
         self.ws: websocket.WebSocketApp | None = None
@@ -46,8 +47,12 @@ class MstockWebSocket:
         self._ws_thread: threading.Thread | None = None
         self._logged_in = False
         self._login_event = threading.Event()
+        # Fired after LOGIN is sent on a live socket — mirrors official MTicker
+        # on_connect, where send_login_after_connect() then subscribe() run.
+        self.on_connect = None
+        self._is_first_connect = True
 
-    def _build_ws_url(self) -> str:
+    def _build_stream_url(self) -> str:
         """Build the WebSocket URL with the current API key and access token."""
         return f"{self.WS_URL}?API_KEY={self.api_key}&ACCESS_TOKEN={self.auth_token}"
 
@@ -68,11 +73,9 @@ class MstockWebSocket:
             return
         if fresh_token:
             self.auth_token = fresh_token
-            self.ws_url = self._build_ws_url()
+            self.stream_url = self._build_stream_url()
         else:
-            logger.warning(
-                "mstock token_provider returned no token; keeping existing access token"
-            )
+            logger.warning("mstock token_provider returned no token; keeping existing access token")
 
     @staticmethod
     def parse_binary_packet(data: bytes) -> dict | None:
@@ -93,13 +96,24 @@ class MstockWebSocket:
                     "sequence_number": struct.unpack("<Q", data[27:35])[0],
                     "exchange_timestamp": struct.unpack("<Q", data[35:43])[0],
                     "ltp": struct.unpack("<Q", data[43:51])[0] / 100.0,
-                    "last_traded_qty": 0, "avg_price": 0, "volume": 0,
-                    "total_buy_qty": 0, "total_sell_qty": 0,
-                    "open": 0, "high": 0, "low": 0, "close": 0,
-                    "last_traded_timestamp": 0, "oi": 0, "oi_percent": 0,
-                    "upper_circuit": 0, "lower_circuit": 0,
-                    "week_52_high": 0, "week_52_low": 0,
-                    "bids": [], "asks": [],
+                    "last_traded_qty": 0,
+                    "avg_price": 0,
+                    "volume": 0,
+                    "total_buy_qty": 0,
+                    "total_sell_qty": 0,
+                    "open": 0,
+                    "high": 0,
+                    "low": 0,
+                    "close": 0,
+                    "last_traded_timestamp": 0,
+                    "oi": 0,
+                    "oi_percent": 0,
+                    "upper_circuit": 0,
+                    "lower_circuit": 0,
+                    "week_52_high": 0,
+                    "week_52_low": 0,
+                    "bids": [],
+                    "asks": [],
                 }
                 return quote
 
@@ -120,19 +134,23 @@ class MstockWebSocket:
                     "high": struct.unpack("<Q", data[99:107])[0] / 100.0,
                     "low": struct.unpack("<Q", data[107:115])[0] / 100.0,
                     "close": struct.unpack("<Q", data[115:123])[0] / 100.0,
-                    "last_traded_timestamp": 0, "oi": 0, "oi_percent": 0,
-                    "upper_circuit": 0, "lower_circuit": 0,
-                    "week_52_high": 0, "week_52_low": 0,
-                    "bids": [], "asks": [],
+                    "last_traded_timestamp": 0,
+                    "oi": 0,
+                    "oi_percent": 0,
+                    "upper_circuit": 0,
+                    "lower_circuit": 0,
+                    "week_52_high": 0,
+                    "week_52_low": 0,
+                    "bids": [],
+                    "asks": [],
                 }
                 return quote
 
             elif len(data) == 379:
                 packet = data
             elif len(data) >= 383:
-                num_packets = struct.unpack("<H", data[0:2])[0]
-                packet_size = struct.unpack("<H", data[2:4])[0]
-                packet = data[4:4 + 379]
+                # Header is 2-byte packet count + 2-byte packet size; payload follows.
+                packet = data[4 : 4 + 379]
             else:
                 logger.error(f"Invalid packet size: {len(data)} bytes")
                 return None
@@ -171,9 +189,14 @@ class MstockWebSocket:
             for i in range(5):
                 bid_offset = i * 20
                 try:
-                    qty = struct.unpack("<Q", depth_data[bid_offset + 2:bid_offset + 10])[0]
-                    price = struct.unpack("<Q", depth_data[bid_offset + 10:bid_offset + 18])[0] / 100.0
-                    num_orders = struct.unpack("<H", depth_data[bid_offset + 18:bid_offset + 20])[0]
+                    qty = struct.unpack("<Q", depth_data[bid_offset + 2 : bid_offset + 10])[0]
+                    price = (
+                        struct.unpack("<Q", depth_data[bid_offset + 10 : bid_offset + 18])[0]
+                        / 100.0
+                    )
+                    num_orders = struct.unpack("<H", depth_data[bid_offset + 18 : bid_offset + 20])[
+                        0
+                    ]
                     quote["bids"].append({"price": price, "quantity": qty, "orders": num_orders})
                 except Exception:
                     quote["bids"].append({"price": 0, "quantity": 0, "orders": 0})
@@ -181,9 +204,14 @@ class MstockWebSocket:
             for i in range(5):
                 ask_offset = 100 + (i * 20)
                 try:
-                    qty = struct.unpack("<Q", depth_data[ask_offset + 2:ask_offset + 10])[0]
-                    price = struct.unpack("<Q", depth_data[ask_offset + 10:ask_offset + 18])[0] / 100.0
-                    num_orders = struct.unpack("<H", depth_data[ask_offset + 18:ask_offset + 20])[0]
+                    qty = struct.unpack("<Q", depth_data[ask_offset + 2 : ask_offset + 10])[0]
+                    price = (
+                        struct.unpack("<Q", depth_data[ask_offset + 10 : ask_offset + 18])[0]
+                        / 100.0
+                    )
+                    num_orders = struct.unpack("<H", depth_data[ask_offset + 18 : ask_offset + 20])[
+                        0
+                    ]
                     quote["asks"].append({"price": price, "quantity": qty, "orders": num_orders})
                 except Exception:
                     quote["asks"].append({"price": 0, "quantity": 0, "orders": 0})
@@ -207,10 +235,11 @@ class MstockWebSocket:
         self.data_callback = data_callback
         self.running = True
         self._logged_in = False
+        self._is_first_connect = True
         self._login_event.clear()
 
         self.ws = websocket.WebSocketApp(
-            self.ws_url,
+            self.stream_url,
             on_open=self._on_ws_open,
             on_message=self._on_ws_message,
             on_error=self._on_ws_error,
@@ -227,6 +256,10 @@ class MstockWebSocket:
         max_attempts = 10
 
         while self.running:
+            self._connected = False
+            self._logged_in = False
+            self._login_event.clear()
+
             try:
                 self.ws.run_forever(
                     sslopt={"cert_reqs": ssl.CERT_NONE},
@@ -238,6 +271,7 @@ class MstockWebSocket:
 
             self._connected = False
             self._logged_in = False
+            self._login_event.clear()
 
             if not self.running:
                 break
@@ -247,34 +281,76 @@ class MstockWebSocket:
                 logger.error("Max reconnect attempts reached")
                 break
 
-            delay = min(2 * (1.5 ** self._reconnect_attempts), 60)
+            delay = min(2 * (1.5**self._reconnect_attempts), 60)
             logger.info(f"Reconnecting in {delay:.0f}s (attempt {self._reconnect_attempts})...")
             time.sleep(delay)
 
             # Re-read a fresh access token before reconnecting so a reconnect
-            # after the daily token rollover uses a live token. Both self.ws_url
+            # after the daily token rollover uses a live token. Both self.stream_url
             # and the LOGIN payload in _on_ws_open derive from self.auth_token.
             self._refresh_auth_token()
 
             # Recreate WebSocketApp for reconnection
             self.ws = websocket.WebSocketApp(
-                self.ws_url,
+                self.stream_url,
                 on_open=self._on_ws_open,
                 on_message=self._on_ws_message,
                 on_error=self._on_ws_error,
                 on_close=self._on_ws_close,
             )
 
+    def _send_login(self, ws) -> None:
+        """Send LOGIN:ACCESS_TOKEN — mirrors official MTicker.send_login_after_connect()."""
+        login_msg = f"LOGIN:{self.auth_token}"
+        ws.send(login_msg)
+        logger.debug("Sent LOGIN message")
+
+    def _confirm_session_ready(self) -> None:
+        """
+        Mark the session ready after LOGIN and notify the adapter.
+
+        Official SDK flow (web_socket_test.py on_connect):
+          1. send_login_after_connect()
+          2. subscribe(...)
+        We do not wait for a text login ACK — the official sample does not either.
+        """
+        if self._logged_in:
+            return
+
+        self._logged_in = True
+        self._login_event.set()
+        logger.info("mstock login confirmed (LOGIN sent)")
+
+        # Reconnect path: official MTicker._on_open calls resubscribe().
+        if not self._is_first_connect:
+            self._resubscribe_all()
+
+        self._is_first_connect = False
+
+        if self.on_connect:
+            try:
+                self.on_connect()
+            except Exception as callback_err:
+                logger.error(f"mstock on_connect callback error: {callback_err}")
+
     def _on_ws_open(self, ws):
-        """Called when WebSocket connection is opened"""
+        """
+        Called when WebSocket connection is opened.
+
+        Matches official SDK: LOGIN first, then treat session as ready so
+        subscribers can send (via on_connect / resubscribe).
+        """
         logger.info("mstock WebSocket connected")
         self._connected = True
         self._reconnect_attempts = 0
 
-        # Send LOGIN message
-        login_msg = f"LOGIN:{self.auth_token}"
-        ws.send(login_msg)
-        logger.debug("Sent LOGIN message")
+        try:
+            self._send_login(ws)
+        except Exception as e:
+            logger.error(f"Failed to send mstock LOGIN: {e}")
+            return
+
+        self._confirm_session_ready()
 
     def _on_ws_message(self, ws, message):
         """Called for both binary and text messages"""
@@ -286,38 +362,44 @@ class MstockWebSocket:
                     self.data_callback(quote_data)
         elif isinstance(message, str):
             logger.debug(f"Received string message: {message}")
-            # Mark as logged in after receiving login response
-            if not self._logged_in:
-                self._logged_in = True
-                self._login_event.set()
-                logger.info("mstock login confirmed")
-
-                # Re-subscribe to existing subscriptions
-                self._resubscribe_all()
+            lowered = message.lower()
+            if "error" in lowered or "fail" in lowered or "invalid" in lowered:
+                logger.warning(f"mstock WebSocket message: {message}")
 
     def _on_ws_error(self, ws, error):
         """Called on WebSocket error"""
         logger.error(f"WebSocket error: {error}")
         self._connected = False
+        self._logged_in = False
+        self._login_event.clear()
 
     def _on_ws_close(self, ws, close_status_code, close_msg):
         """Called when WebSocket is closed"""
         logger.info(f"WebSocket closed (code={close_status_code}, msg={close_msg})")
         self._connected = False
         self._logged_in = False
+        self._login_event.clear()
 
     def _resubscribe_all(self):
-        """Re-subscribe to all tracked subscriptions after reconnection"""
-        for correlation_id, sub in list(self.subscriptions.items()):
+        """Re-subscribe to all tracked client subscriptions after reconnection."""
+        pending = dict(self.subscriptions)
+        for correlation_id, sub in pending.items():
             try:
-                self.subscribe_stream(correlation_id, sub["token"], sub["exchange_type"], sub["mode"])
+                self.subscribe_stream(
+                    correlation_id, sub["token"], sub["exchange_type"], sub["mode"]
+                )
                 logger.info(f"Re-subscribed to {sub['token']} mode {sub['mode']}")
             except Exception as e:
                 logger.error(f"Error re-subscribing to {sub['token']}: {e}")
 
-    def subscribe_stream(self, correlation_id: str, token: str, exchange_type: int, mode: int) -> bool:
+    def subscribe_stream(
+        self, correlation_id: str, token: str, exchange_type: int, mode: int
+    ) -> bool:
         """
         Subscribe to a symbol on the persistent WebSocket connection.
+
+        Must be called after LOGIN (is_connected), matching official sample
+        which only calls subscribe inside on_connect after send_login_after_connect.
 
         Args:
             correlation_id: Unique ID for this subscription
@@ -325,8 +407,8 @@ class MstockWebSocket:
             exchange_type: Exchange type code
             mode: Subscription mode
         """
-        if not self._connected or not self.ws:
-            logger.error("WebSocket not connected")
+        if not self.is_connected() or not self.ws:
+            logger.error("WebSocket not connected / not logged in — cannot subscribe yet")
             return False
 
         try:
@@ -359,7 +441,7 @@ class MstockWebSocket:
         Args:
             correlation_id: Unique ID of the subscription to remove
         """
-        if not self._connected or not self.ws:
+        if not self.is_connected() or not self.ws:
             return False
 
         try:
@@ -372,7 +454,9 @@ class MstockWebSocket:
                 "action": 0,
                 "params": {
                     "mode": sub["mode"],
-                    "tokenList": [{"exchangeType": sub["exchange_type"], "tokens": [str(sub["token"])]}],
+                    "tokenList": [
+                        {"exchangeType": sub["exchange_type"], "tokens": [str(sub["token"])]}
+                    ],
                 },
             }
 
@@ -390,6 +474,8 @@ class MstockWebSocket:
         """Disconnect the persistent WebSocket connection"""
         self.running = False
         self._connected = False
+        self._logged_in = False
+        self._login_event.clear()
 
         if self.ws:
             try:
@@ -405,6 +491,10 @@ class MstockWebSocket:
         """Check if WebSocket is connected and logged in"""
         return self._connected and self._logged_in and self.running
 
+    def wait_for_connection(self, timeout: float = 15.0) -> bool:
+        """Wait until LOGIN has been sent and the session is ready for subscribe."""
+        return self._login_event.wait(timeout=timeout) and self.is_connected()
+
     # ==================== One-off Fetch (sync) ====================
 
     def fetch_quote(self, token: str, exchange_type: int, mode: int = 3) -> dict | None:
@@ -414,8 +504,9 @@ class MstockWebSocket:
         """
         try:
             import websocket as ws_module
+
             ws = ws_module.create_connection(
-                self.ws_url,
+                self.stream_url,
                 sslopt={"cert_reqs": ssl.CERT_NONE},
                 timeout=10,
             )
