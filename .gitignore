@@ -93,3 +93,9 @@ yarn-error.log*
 
 # Windows NUL file
 nul
+
+# Agents, Backtesting, Skills, Strategies
+.agents/
+backtesting/
+skills-lock.json
+strategies/examples/custom/
